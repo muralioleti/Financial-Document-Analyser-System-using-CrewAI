@@ -1,63 +1,81 @@
 # main.py
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import JSONResponse
-import os
-import uuid
-import asyncio
-import logging
-
+from fastapi import FastAPI, UploadFile, File
 from crew import run_financial_analysis
+from database import SessionLocal, AnalysisResult
+from worker import analyze_document_task
 
-app = FastAPI(title="Financial Document Analyzer")
-logging.basicConfig(level=logging.INFO)
+app = FastAPI()
 
-@app.get("/")
-async def root():
-    return {"message": "Financial Document Analyzer API is running"}
 
+# ---------- SYNC ENDPOINT ----------
 @app.post("/analyze")
-async def analyze_document(
-    file: UploadFile = File(...),
-    query: str = Form(default="Analyze this financial document for investment insights"),
-):
-    # Basic file validation
-    filename = file.filename or ""
-    if not filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+async def analyze_document(file: UploadFile = File(...)):
+    """
+    Synchronous analysis endpoint.
+    Upload a financial document, run analysis immediately,
+    and store results in the database.
+    """
+    # Save uploaded file
+    contents = await file.read()
+    filepath = f"data/{file.filename}"
+    with open(filepath, "wb") as f:
+        f.write(contents)
 
-    os.makedirs("data", exist_ok=True)
-    file_id = str(uuid.uuid4())
-    file_path = os.path.join("data", f"financial_document_{file_id}.pdf")
+    # Run analysis directly
+    results = run_financial_analysis(filepath)
 
-    try:
-        # Save uploaded file
-        with open(file_path, "wb") as f:
-            content = await file.read()
-            f.write(content)
+    # Save results to DB
+    db = SessionLocal()
+    analysis_entry = AnalysisResult(
+        filename=file.filename,
+        investment_analysis=results["analysis"],
+        risk_assessment=results["risk"]
+    )
+    db.add(analysis_entry)
+    db.commit()
+    db.refresh(analysis_entry)
+    db.close()
 
-        if not query or query.strip() == "":
-            query = "Analyze this financial document for investment insights"
+    return {
+        "id": analysis_entry.id,
+        "filename": file.filename,
+        "analysis": results["analysis"],
+        "risk": results["risk"]
+    }
 
-        # run_financial_analysis is blocking; run in thread to avoid blocking event loop
-        result = await asyncio.to_thread(run_financial_analysis, query.strip(), file_path)
 
-        # Convert result to serializable form (Crew result may be complex)
-        return JSONResponse(
-            content={
-                "status": "success",
-                "query": query,
-                "analysis": str(result),
-                "file_processed": filename,
-            }
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.exception("Error processing document")
-        raise HTTPException(status_code=500, detail=f"Error processing financial document: {str(e)}")
-    finally:
-        try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-        except Exception:
-            logging.warning("Failed to remove temp file", exc_info=True)
+# ---------- ASYNC ENDPOINT (Celery) ----------
+@app.post("/analyze_async")
+async def analyze_document_async(file: UploadFile = File(...)):
+    """
+    Asynchronous analysis endpoint.
+    Upload a financial document and offload analysis to Celery worker.
+    """
+    # Save uploaded file
+    contents = await file.read()
+    filepath = f"data/{file.filename}"
+    with open(filepath, "wb") as f:
+        f.write(contents)
+
+    # Send task to Celery worker
+    task = analyze_document_task.delay(filepath, file.filename)
+    return {"task_id": task.id, "status": "processing"}
+
+
+# ---------- TASK STATUS CHECK ----------
+@app.get("/task/{task_id}")
+def get_task_result(task_id: str):
+    """
+    Check the status of an async analysis task.
+    """
+    from worker import celery_app
+    task = celery_app.AsyncResult(task_id)
+
+    if task.state == "PENDING":
+        return {"status": "pending"}
+    elif task.state == "SUCCESS":
+        return {"status": "completed", "result": task.result}
+    elif task.state == "FAILURE":
+        return {"status": "failed", "error": str(task.info)}
+    else:
+        return {"status": task.state}
